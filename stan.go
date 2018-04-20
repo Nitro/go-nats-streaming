@@ -173,9 +173,9 @@ type conn struct {
 
 // Closure for ack contexts.
 type ack struct {
-	t  *time.Timer
-	ah AckHandler
-	ch chan error
+	ah        AckHandler
+	awaitChan chan struct{}
+	ch        chan error
 }
 
 // Connect will form a connection to the NATS Streaming subsystem.
@@ -366,7 +366,7 @@ func (sc *conn) PublishAsync(subject string, data []byte, ah AckHandler) (string
 }
 
 func (sc *conn) publishAsync(subject string, data []byte, ah AckHandler, ch chan error) (string, error) {
-	a := &ack{ah: ah, ch: ch}
+	a := &ack{ah: ah, ch: ch, awaitChan: make(chan struct{})}
 	sc.Lock()
 	if sc.nc == nil {
 		sc.Unlock()
@@ -399,7 +399,21 @@ func (sc *conn) publishAsync(subject string, data []byte, ah AckHandler, ch chan
 
 	// Setup the timer for expiration.
 	sc.Lock()
-	a.t = time.AfterFunc(ackTimeout, func() {
+	go sc.awaitAckTimeout(a, ackTimeout, peGUID)
+	sc.Unlock()
+
+	return peGUID, nil
+}
+
+// awaitAckTimeout is run in a gorouting and waits in the background and return an
+// error if there are outstanding Acks
+func (sc *conn) awaitAckTimeout(a *ack, ackTimeout time.Duration, peGUID string) {
+	select {
+	case <-a.awaitChan:
+		// Ack was handled, cancel waiting
+		return
+
+	case <-time.After(ackTimeout):
 		pubAck := sc.removeAck(peGUID)
 		// processAck could get here before and handle the ack.
 		// If that's the case, we would get nil here and simply return.
@@ -411,27 +425,22 @@ func (sc *conn) publishAsync(subject string, data []byte, ah AckHandler, ch chan
 		} else if a.ch != nil {
 			pubAck.ch <- ErrTimeout
 		}
-	})
-	sc.Unlock()
-
-	return peGUID, nil
+	}
 }
 
 // removeAck removes the ack from the pubAckMap and cancels any state, e.g. timers
 func (sc *conn) removeAck(guid string) *ack {
-	var t *time.Timer
 	sc.Lock()
 	a := sc.pubAckMap[guid]
 	if a != nil {
-		t = a.t
 		delete(sc.pubAckMap, guid)
 	}
 	pac := sc.pubAckChan
 	sc.Unlock()
 
-	// Cancel timer if needed.
-	if t != nil {
-		t.Stop()
+	if (a != nil) && (a.awaitChan != nil) {
+		// Cancel waiting for ack timeout
+		close(a.awaitChan)
 	}
 
 	// Remove from channel to unblock PublishAsync
